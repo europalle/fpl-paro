@@ -63,6 +63,16 @@ CAPTAIN_MIN_MINUTES = 45
 # you are just captaining a worse player.
 CAPTAIN_EP_FLOOR = 0.8
 
+# Before this many finished gameweeks, no points gap is a real gap. Totals are
+# tiny, variance is enormous, and a single captain haul erases a fortnight of
+# deficit. Chasing here is how you lose a season in August.
+STANCE_SETTLE_GWS = 6
+
+# Points per remaining gameweek you need to claw back. This, not the raw gap,
+# is what says whether you can afford to be sensible.
+PRESSURE_BALANCED = 0.75
+PRESSURE_AGGRESSIVE = 2.0
+
 CHIP_LABELS = {
     "wildcard": "Wildcard",
     "freehit": "Free Hit",
@@ -453,24 +463,17 @@ def league_position(squads, my_entry):
     }
 
 
-def risk_stance(pos):
+def risk_stance(pos, finished_gws, total_gws):
     """How much variance your league position actually calls for.
 
-    This is the piece that makes the rest of the brief mean something. Chasing
-    from a long way back with the same players everyone else owns is
-    mathematically hopeless: if your rivals own him too, his haul moves nobody.
+    Judged as points per REMAINING gameweek, not raw points. Twenty-nine behind
+    with thirty-seven weeks to play is under a point a week and needs no heroics.
+    The same gap with five weeks left is desperate. The old version could not
+    tell those apart and told you to gamble in August.
     """
-    rank, size = pos["rank"], pos["size"]
+    remaining = max(total_gws - finished_gws, 1)
     behind = abs(pos["gap_leader"])
     above, gap_above = pos["above"], pos["gap_above"]
-
-    if rank == 1:
-        lead = abs(pos["gap_below"]) if pos["gap_below"] is not None else 0
-        return ("protect", (
-            f"You lead by {lead} points. Own what your rivals own. Every "
-            f"template player you share is a week they cannot gain on you, and "
-            f"your lead does the rest. Differentials are how leads get thrown "
-            f"away, not defended."))
 
     if not above:
         catch = ""
@@ -479,22 +482,44 @@ def risk_stance(pos):
     else:
         catch = f"{abs(gap_above)} points behind {above['name']}"
 
-    if behind <= 10:
+    if finished_gws < STANCE_SETTLE_GWS:
         return ("balanced", (
-            f"You are {behind} off the top and {catch}. Close enough that the "
-            f"template keeps you in touch. Take differentials where they are "
-            f"cheap in expected points, not as a gamble."))
-    if behind <= 30:
+            f"Only {finished_gws} of {total_gws} gameweeks have been played, so "
+            f"no gap in this table is real yet. You are {behind} behind the "
+            f"leader and {catch}, which is about {behind / remaining:.2f} points "
+            f"per remaining week, less than one good captaincy call. Pick the "
+            f"best players available and let the season come to you. Chasing "
+            f"this early is how people lose seasons in August."))
+
+    if pos["rank"] == 1:
+        lead = abs(pos["gap_below"]) if pos["gap_below"] is not None else 0
+        return ("protect", (
+            f"You lead by {lead} points with {remaining} weeks left. Own what "
+            f"your rivals own. Every template player you share is a week they "
+            f"cannot gain on you. Differentials are how leads get thrown away, "
+            f"not defended."))
+
+    pressure = behind / remaining
+
+    if pressure < PRESSURE_BALANCED:
+        return ("balanced", (
+            f"You are {behind} behind and {catch}, with {remaining} weeks left. "
+            f"That is {pressure:.2f} points a week, well inside normal variance. "
+            f"Take the best expected points on offer. You do not need a gamble "
+            f"to close this."))
+    if pressure < PRESSURE_AGGRESSIVE:
         return ("lean aggressive", (
-            f"You are {behind} behind the leader and {catch}. Matching the "
-            f"field holds this gap, it does not close it. You need one or two "
-            f"players your rivals do not have, ideally with the fixtures to "
-            f"justify them on their own merits."))
+            f"You are {behind} behind and {catch}, with {remaining} weeks left. "
+            f"That is {pressure:.2f} points a week, which the template alone "
+            f"will not deliver. You want one or two players your rivals do not "
+            f"have, justified on their own merits rather than picked for "
+            f"novelty."))
     return ("aggressive", (
-        f"You are {behind} behind the leader and {catch}. A gap this size does "
-        f"not close through good template management. It closes when players "
-        f"your rivals do not own return heavily and theirs do not. Accept the "
-        f"variance, because the safe route mathematically cannot catch up."))
+        f"You are {behind} behind and {catch}, with only {remaining} weeks left. "
+        f"That is {pressure:.2f} points a week, which sensible management does "
+        f"not produce. This gap closes when players your rivals do not own "
+        f"return heavily and theirs do not. Take the variance, because the safe "
+        f"route runs out of road."))
 
 
 def captain_shortlist(my_picks, players, fixmap, next_gw, eo, limit=6):
@@ -543,7 +568,14 @@ def recommend_captain(rows, stance):
         return None, ""
     top = rows[0]
 
-    if stance in ("protect", "balanced"):
+    if stance == "balanced":
+        # No need for ownership games. Take the best player on the board.
+        return top, (f"{top['name']} is simply the strongest pick available "
+                     f"({top['eo']:.0f}% effective ownership here). Nothing "
+                     f"about your position calls for a gamble, so do not "
+                     f"manufacture one.")
+
+    if stance == "protect":
         safe = max(rows[:3], key=lambda r: r["eo"])
         if safe["id"] == top["id"]:
             return top, (f"{top['name']} is both the strongest pick and the most "
@@ -551,8 +583,7 @@ def recommend_captain(rows, stance):
                          f"ownership. No reason to be clever.")
         return safe, (f"{safe['name']} at {safe['eo']:.0f}% effective ownership. "
                       f"{top['name']} scores slightly higher, but holding the "
-                      f"same armband as your rivals is the point from where you "
-                      f"are sitting.")
+                      f"same armband as your rivals is what defends a lead.")
 
     # Chasing: prefer lower effective ownership, but only among picks that are
     # genuinely competitive on PROJECTED POINTS. Gating on the composite score
@@ -725,10 +756,16 @@ def render(ctx):
         add("")
     add("| Player | Club | Opponent | FDR | xGI/90 | Form | Proj | League EO |")
     add("|---|---|---|---|---|---|---|---|")
+    picked_id = ctx["captain_pick"]["id"] if ctx["captain_pick"] else None
     for r in ctx["captains"]:
-        add(f"| {r['name']} | {r['club']} | {r['opp']} | {r['fdr']} | "
+        chosen = r["id"] == picked_id
+        label = f"**{r['name']} (pick)**" if chosen else r["name"]
+        add(f"| {label} | {r['club']} | {r['opp']} | {r['fdr']} | "
             f"{r['xgi90'] if r['xgi90'] is not None else 'n/a'} | "
             f"{r['form']} | {r['ep']} | {r['eo']:.0f}% |")
+    add("")
+    add("Rows are ordered by overall score, so the recommended pick is not "
+        "always the top line. When it is not, the reasoning above says why.")
     add("")
     add("League EO is effective ownership inside your mini-league: how much of "
         "the field starts him, with captaincy counted twice and a triple "
@@ -886,7 +923,8 @@ def main():
 
     owners, eo = ownership_and_eo(squads)
     pos = league_position(squads, args.entry)
-    stance, stance_reason = risk_stance(pos)
+    total_gws = len(boot["events"]) or 38
+    stance, stance_reason = risk_stance(pos, finished_gws, total_gws)
     size = len(squads)
 
     injured, doubtful, benchwarmers = squad_alerts(my_picks, players, finished_gws)
