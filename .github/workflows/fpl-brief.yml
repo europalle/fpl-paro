@@ -45,26 +45,37 @@ jobs:
           set -euo pipefail
           git config user.name  "fpl-brief bot"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add briefs/
 
-          if git diff --staged --quiet; then
-            echo "No change in today's brief, nothing to commit."
-            exit 0
-          fi
+          BRIEF="$(ls briefs/brief-*.md | sort | tail -1)"
+          echo "Generated: ${BRIEF}"
+          cp "${BRIEF}" "${RUNNER_TEMP}/brief.md"
 
-          git commit -m "FPL brief $(date -u +%Y-%m-%d)"
-
-          # The brief takes a few seconds to build, and anything pushed to main
-          # in that window makes this push a non-fast-forward. Rebase onto
-          # whatever arrived and try again rather than losing the run.
+          # Rebasing is the wrong tool here. The brief is regenerated output, so
+          # on a clash the fresh copy simply wins, and there is nothing to merge.
+          # Reset hard onto whatever main looks like now, drop the new brief on
+          # top, and commit that. This can never conflict and can never revert
+          # somebody else's commit, because we take their tree wholesale and
+          # only add our one generated file to it.
           for attempt in 1 2 3; do
+            git fetch --quiet origin main
+            git reset --quiet --hard origin/main
+            mkdir -p briefs
+            cp "${RUNNER_TEMP}/brief.md" "${BRIEF}"
+            git add briefs/
+
+            if git diff --staged --quiet; then
+              echo "Brief is identical to the one already on main, nothing to commit."
+              exit 0
+            fi
+
+            git commit --quiet -m "FPL brief $(date -u +%Y-%m-%d)"
+
             if git push origin HEAD:main; then
               echo "Pushed on attempt ${attempt}."
               exit 0
             fi
-            echo "Push rejected on attempt ${attempt}, rebasing onto origin/main."
-            git pull --rebase origin main
+            echo "Push lost a race on attempt ${attempt}, retrying against new main."
           done
 
-          echo "Push still failing after 3 attempts. The brief was generated but not saved."
+          echo "Push still failing after 3 attempts. Brief was generated but not saved."
           exit 1
