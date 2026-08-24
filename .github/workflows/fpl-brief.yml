@@ -22,6 +22,10 @@ jobs:
     steps:
       - name: Check out repo
         uses: actions/checkout@v4
+        with:
+          # Full history. The default shallow clone cannot rebase, so a push
+          # that loses a race with a human commit fails with no way to recover.
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -38,12 +42,29 @@ jobs:
 
       - name: Commit brief
         run: |
+          set -euo pipefail
           git config user.name  "fpl-brief bot"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add briefs/
+
           if git diff --staged --quiet; then
             echo "No change in today's brief, nothing to commit."
-          else
-            git commit -m "FPL brief $(date -u +%Y-%m-%d)"
-            git push
+            exit 0
           fi
+
+          git commit -m "FPL brief $(date -u +%Y-%m-%d)"
+
+          # The brief takes a few seconds to build, and anything pushed to main
+          # in that window makes this push a non-fast-forward. Rebase onto
+          # whatever arrived and try again rather than losing the run.
+          for attempt in 1 2 3; do
+            if git push origin HEAD:main; then
+              echo "Pushed on attempt ${attempt}."
+              exit 0
+            fi
+            echo "Push rejected on attempt ${attempt}, rebasing onto origin/main."
+            git pull --rebase origin main
+          done
+
+          echo "Push still failing after 3 attempts. The brief was generated but not saved."
+          exit 1
