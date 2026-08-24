@@ -483,8 +483,13 @@ def risk_stance(pos, finished_gws, total_gws):
         catch = f"{abs(gap_above)} points behind {above['name']}"
 
     if finished_gws < STANCE_SETTLE_GWS:
+        # finished_gws can read 0 while points already exist, because FPL does
+        # not flag a gameweek finished until bonus has settled. "0 of 38 played"
+        # looks like a bug sitting next to a populated table, so say it in words.
+        played = ("The season has barely started" if finished_gws == 0 else
+                  f"Only {finished_gws} of {total_gws} gameweeks are settled")
         return ("balanced", (
-            f"Only {finished_gws} of {total_gws} gameweeks have been played, so "
+            f"{played}, so "
             f"no gap in this table is real yet. You are {behind} behind the "
             f"leader and {catch}, which is about {behind / remaining:.2f} points "
             f"per remaining week, less than one good captaincy call. Pick the "
