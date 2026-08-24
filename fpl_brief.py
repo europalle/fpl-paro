@@ -8,13 +8,15 @@ Pulls live data from the public FPL API, cross-references it against your own
 squad and your mini-league rivals, and writes a markdown brief telling you what
 actually needs a decision today.
 
+Everything is framed against the mini-league, not overall rank. A move that
+gains you 3 points on the field but 0 on the five people you actually care
+about is not a good move.
+
 Designed to run unattended on a schedule. It never makes a transfer for you.
-It surfaces the three or four things worth thinking about and shuts up about
-the rest.
 
 Usage:
     python3 fpl_brief.py --entry 8876628 --league 123456
-    python3 fpl_brief.py --entry 8876628 --league 123456 --horizon 6 --out brief.md
+    python3 fpl_brief.py --entry 8876628 --league 123456 --out "briefs/brief-{date}.md"
 
 Exit codes:
     0  brief written
@@ -34,12 +36,66 @@ import urllib.request
 from collections import defaultdict
 
 BASE = "https://fantasy.premierleague.com/api"
-UA = "Mozilla/5.0 (compatible; fpl-brief/1.0)"
+UA = "Mozilla/5.0 (compatible; fpl-brief/2.0)"
 THROTTLE = 0.4
 
-# How much a price change matters relative to points. Roughly: a 0.1m rise you
-# missed is worth about a fifth of a point of real value in most weeks.
-PRICE_ALERT_THRESHOLD = 85.0   # net transfer momentum percentile that flags a move
+# Net transfer momentum percentile that counts as "the market is moving".
+PRICE_ALERT_THRESHOLD = 85.0
+
+# Below this many finished gameweeks, one rotation looks identical to a player
+# who never plays. The brief refuses to call anyone a dead squad slot until it
+# has enough evidence to mean it.
+EARLY_SEASON_GWS = 4
+
+# Minutes a player needs before over/underperformance against xG says anything.
+UNDERLYING_MIN_MINUTES = 180
+
+# Minutes before per-90 rates are stable enough to steer a captain pick. Below
+# this, one 20-minute cameo with a big chance produces a monstrous xGI/90 and
+# the armband follows it off a cliff.
+XGI_TRUST_MINUTES = 270
+
+# A player needs to be an actual starter to be worth captaining.
+CAPTAIN_MIN_MINUTES = 45
+
+# A differential captain must still project within this fraction of the best
+# projected score available. Below it, you are not taking a calculated risk,
+# you are just captaining a worse player.
+CAPTAIN_EP_FLOOR = 0.8
+
+CHIP_LABELS = {
+    "wildcard": "Wildcard",
+    "freehit": "Free Hit",
+    "bboost": "Bench Boost",
+    "3xc": "Triple Captain",
+    "manager": "Assistant Manager",
+}
+
+
+# --------------------------------------------------------------------------
+# small helpers
+# --------------------------------------------------------------------------
+
+def _f(v):
+    """FPL returns numbers as strings, nulls, and occasionally nothing."""
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def per90(total, minutes):
+    return round(total * 90.0 / minutes, 2) if minutes else 0.0
+
+
+def ordinal(n):
+    if 10 <= n % 100 <= 20:
+        return f"{n}th"
+    return f"{n}{ {1: 'st', 2: 'nd', 3: 'rd'}.get(n % 10, 'th') }"
+
+
+def chip_label(name):
+    return CHIP_LABELS.get(name, name.title() if name else "")
 
 
 # --------------------------------------------------------------------------
@@ -64,8 +120,32 @@ def get(path, retries=3):
 # loading
 # --------------------------------------------------------------------------
 
+EXPECTED_ELEMENT_FIELDS = [
+    "expected_goals", "expected_assists", "expected_goal_involvements",
+    "ep_next", "starts", "transfers_in_event", "transfers_out_event",
+    "cost_change_event", "goals_scored", "assists",
+]
+
+
+def check_fields(boot):
+    """Warn loudly if the API stopped providing something we rely on.
+
+    Every one of these is read with a default, so a rename would silently
+    degrade the brief into confident nonsense rather than crashing. Better to
+    say so on stderr where the Actions log will keep it.
+    """
+    sample = boot["elements"][0] if boot.get("elements") else {}
+    missing = [f for f in EXPECTED_ELEMENT_FIELDS if f not in sample]
+    if missing:
+        print(f"WARNING: bootstrap-static elements are missing expected fields: "
+              f"{', '.join(missing)}. Anything derived from them will read as "
+              f"zero.", file=sys.stderr)
+    return missing
+
+
 def load_core():
     boot = get("bootstrap-static/")
+    check_fields(boot)
     time.sleep(THROTTLE)
     fixtures = get("fixtures/")
 
@@ -74,6 +154,12 @@ def load_core():
 
     players = {}
     for p in boot["elements"]:
+        mins = p["minutes"]
+        goals = p.get("goals_scored", 0)
+        assists = p.get("assists", 0)
+        xg = _f(p.get("expected_goals"))
+        xa = _f(p.get("expected_assists"))
+        xgi = _f(p.get("expected_goal_involvements")) or (xg + xa)
         players[p["id"]] = {
             "id": p["id"],
             "name": p["web_name"],
@@ -81,11 +167,11 @@ def load_core():
             "club": teams.get(p["team"], "?"),
             "pos": postypes.get(p["element_type"], "?"),
             "price": p["now_cost"] / 10.0,
-            "owned": float(p["selected_by_percent"]),
+            "owned": _f(p["selected_by_percent"]),
             "points": p["total_points"],
-            "ppg": float(p["points_per_game"] or 0),
-            "form": float(p["form"] or 0),
-            "minutes": p["minutes"],
+            "ppg": _f(p["points_per_game"]),
+            "form": _f(p["form"]),
+            "minutes": mins,
             "status": p["status"],
             "chance": p["chance_of_playing_next_round"],
             "news": p["news"],
@@ -93,9 +179,19 @@ def load_core():
             "out_event": p.get("transfers_out_event", 0),
             "cost_change_event": p.get("cost_change_event", 0),
             "starts": p.get("starts", 0),
+            "goals": goals,
+            "assists": assists,
+            "xg": xg,
+            "xa": xa,
+            "xgi": xgi,
+            "xg90": per90(xg, mins),
+            "xa90": per90(xa, mins),
+            "xgi90": per90(xgi, mins),
+            # positive means scoring more than the chances deserve
+            "overperf": round((goals + assists) - xgi, 2),
+            "ep_next": _f(p.get("ep_next")),
         }
 
-    # next unfinished gameweek
     current, nxt = None, None
     for ev in boot["events"]:
         if ev.get("is_current"):
@@ -106,7 +202,9 @@ def load_core():
         upcoming = [e for e in boot["events"] if not e["finished"]]
         nxt = upcoming[0] if upcoming else boot["events"][-1]
 
-    return boot, teams, players, fixtures, current, nxt
+    finished_gws = sum(1 for e in boot["events"] if e.get("finished"))
+
+    return boot, teams, players, fixtures, current, nxt, finished_gws
 
 
 def fixture_map(fixtures, teams, start_gw, horizon):
@@ -140,7 +238,7 @@ def load_league(league_id):
 
 
 def load_squads(standings, gw):
-    """entry_id -> {'name':..., 'picks':[player_id...], 'captain':id}"""
+    """entry_id -> squad, including the multipliers needed for real ownership."""
     squads = {}
     for s in standings:
         time.sleep(THROTTLE)
@@ -148,16 +246,62 @@ def load_squads(standings, gw):
             data = get(f"entry/{s['entry']}/event/{gw}/picks/")
         except urllib.error.HTTPError:
             continue
-        captain = next((p["element"] for p in data["picks"] if p["is_captain"]), None)
+        picks = data["picks"]
+        hist = data.get("entry_history") or {}
         squads[s["entry"]] = {
+            "entry": s["entry"],
             "name": s["entry_name"],
             "manager": s["player_name"],
             "rank": s["rank"],
             "total": s["total"],
-            "picks": [p["element"] for p in data["picks"]],
-            "captain": captain,
+            "picks": [p["element"] for p in picks],
+            "starters": [p["element"] for p in picks if p["position"] <= 11],
+            "multipliers": {p["element"]: p["multiplier"] for p in picks},
+            "captain": next((p["element"] for p in picks if p["is_captain"]), None),
+            "vice": next((p["element"] for p in picks if p["is_vice_captain"]), None),
+            "chip": data.get("active_chip"),
+            "transfers": hist.get("event_transfers", 0),
+            "hit": hist.get("event_transfers_cost", 0),
+            "bench_pts": hist.get("points_on_bench", 0),
         }
     return squads
+
+
+def load_chip_history(standings):
+    """entry_id -> [(chip_name, gameweek), ...] used so far this season."""
+    out = {}
+    for s in standings:
+        time.sleep(THROTTLE)
+        try:
+            data = get(f"entry/{s['entry']}/history/")
+        except urllib.error.HTTPError:
+            continue
+        out[s["entry"]] = [(c.get("name"), c.get("event"))
+                           for c in (data.get("chips") or [])]
+    return out
+
+
+def load_recent_transfers(standings, players, gws):
+    """entry_id -> {gw: [(out_name, in_name), ...]} for the gameweeks asked for."""
+    out = {}
+    wanted = set(gws)
+    for s in standings:
+        time.sleep(THROTTLE)
+        try:
+            data = get(f"entry/{s['entry']}/transfers/")
+        except urllib.error.HTTPError:
+            continue
+        moves = defaultdict(list)
+        for t in (data or []):
+            gw = t.get("event")
+            if gw not in wanted:
+                continue
+            pin = players.get(t["element_in"], {}).get("name", t["element_in"])
+            pout = players.get(t["element_out"], {}).get("name", t["element_out"])
+            moves[gw].append((pout, pin))
+        if moves:
+            out[s["entry"]] = dict(moves)
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -173,8 +317,13 @@ def fixture_score(club, fixmap, horizon):
     return sum(fdrs), runs
 
 
-def squad_alerts(my_picks, players):
-    """Anything in the squad that needs a human decision."""
+def squad_alerts(my_picks, players, finished_gws):
+    """Anything in the squad that needs a human decision.
+
+    The dead-slot test scales with how much football has been played. One
+    rotation in August is not evidence that a player never starts, and calling
+    it evidence produces a panic transfer every week of the early season.
+    """
     injured, doubtful, benchwarmers = [], [], []
     for pid in my_picks:
         p = players.get(pid)
@@ -184,63 +333,253 @@ def squad_alerts(my_picks, players):
             injured.append(p)
         elif p["status"] == "d":
             doubtful.append(p)
-        # played essentially nothing all season and isn't new
-        if p["minutes"] < 45 and p["starts"] == 0:
-            benchwarmers.append(p)
+
+    if finished_gws >= EARLY_SEASON_GWS:
+        available = 90.0 * finished_gws
+        for pid in my_picks:
+            p = players.get(pid)
+            if not p:
+                continue
+            if p["starts"] == 0 and p["minutes"] < 0.25 * available:
+                benchwarmers.append(p)
+
     return injured, doubtful, benchwarmers
 
 
 def price_watch(my_picks, players, all_players):
-    """Flag squad members with strong transfer momentum in either direction."""
+    """Price movement, read correctly for a player you already own.
+
+    Everything here is in your squad, so a rise is value you have already
+    banked, not a reason to buy. Only a fall is actionable, and only if you
+    were selling anyway.
+    """
     nets = [abs(p["in_event"] - p["out_event"]) for p in all_players.values()]
     if not nets:
-        return [], []
+        return [], [], []
     cutoff = statistics.quantiles(nets, n=100)[int(PRICE_ALERT_THRESHOLD) - 1]
-    rising, falling = [], []
+
+    rising, falling, changed = [], [], []
     for pid in my_picks:
         p = players.get(pid)
         if not p:
             continue
+        if p["cost_change_event"]:
+            changed.append(p)
         net = p["in_event"] - p["out_event"]
         if abs(net) < cutoff:
             continue
         (rising if net > 0 else falling).append((p, net))
+
     rising.sort(key=lambda x: -x[1])
     falling.sort(key=lambda x: x[1])
-    return rising, falling
+    changed.sort(key=lambda p: -abs(p["cost_change_event"]))
+    return rising, falling, changed
 
 
-def league_ownership(squads, my_entry):
-    """player_id -> (count, [team names]) across the mini-league."""
+def trusted_xgi90(p):
+    """xGI/90 only when there are enough minutes behind it, else None.
+
+    Printing a rate off 60 minutes next to a note saying xG is not yet
+    meaningful makes the brief argue with itself.
+    """
+    return p["xgi90"] if p["minutes"] >= XGI_TRUST_MINUTES else None
+
+
+def market_movers(players, my_picks, limit=4):
+    """Players the market is piling into that you do not own. Actual buy signals."""
+    owned = set(my_picks)
+    rows = []
+    for p in players.values():
+        if p["id"] in owned or p["status"] != "a":
+            continue
+        net = p["in_event"] - p["out_event"]
+        if net <= 0:
+            continue
+        rows.append((p, net))
+    rows.sort(key=lambda x: -x[1])
+    return rows[:limit]
+
+
+def ownership_and_eo(squads):
+    """Real ownership across the mini-league.
+
+    owners: player_id -> [team names] holding him at all.
+    eo:     player_id -> effective ownership percent, counting only starters
+            and weighting by multiplier, so a captain counts double and a
+            triple captain counts treble. This is the number that decides
+            whether a haul actually moves you in the table.
+    """
+    size = max(len(squads), 1)
     owners = defaultdict(list)
-    for entry, sq in squads.items():
+    weight = defaultdict(float)
+    for sq in squads.values():
         for pid in sq["picks"]:
             owners[pid].append(sq["name"])
-    return owners
+        for pid in sq["starters"]:
+            weight[pid] += sq["multipliers"].get(pid, 1)
+    eo = {pid: round(100.0 * w / size, 1) for pid, w in weight.items()}
+    return owners, eo
 
 
-def captain_shortlist(my_picks, players, fixmap, next_gw, limit=5):
-    """Rank own players for the armband on next gw fixture + form + role."""
+def league_position(squads, my_entry):
+    ordered = sorted(squads.items(), key=lambda kv: (kv[1]["rank"], -kv[1]["total"]))
+    ids = [eid for eid, _ in ordered]
+    if my_entry not in ids:
+        return None
+    idx = ids.index(my_entry)
+    me = squads[my_entry]
+    leader = ordered[0][1]
+    above = ordered[idx - 1][1] if idx > 0 else None
+    below = ordered[idx + 1][1] if idx < len(ordered) - 1 else None
+    return {
+        "rank": idx + 1,
+        "size": len(ordered),
+        "me": me,
+        "leader": leader,
+        "above": above,
+        "below": below,
+        "gap_leader": me["total"] - leader["total"],
+        "gap_above": (me["total"] - above["total"]) if above else None,
+        "gap_below": (me["total"] - below["total"]) if below else None,
+    }
+
+
+def risk_stance(pos):
+    """How much variance your league position actually calls for.
+
+    This is the piece that makes the rest of the brief mean something. Chasing
+    from a long way back with the same players everyone else owns is
+    mathematically hopeless: if your rivals own him too, his haul moves nobody.
+    """
+    rank, size = pos["rank"], pos["size"]
+    behind = abs(pos["gap_leader"])
+    above, gap_above = pos["above"], pos["gap_above"]
+
+    if rank == 1:
+        lead = abs(pos["gap_below"]) if pos["gap_below"] is not None else 0
+        return ("protect", (
+            f"You lead by {lead} points. Own what your rivals own. Every "
+            f"template player you share is a week they cannot gain on you, and "
+            f"your lead does the rest. Differentials are how leads get thrown "
+            f"away, not defended."))
+
+    catch = f"{abs(gap_above)} points behind {above['name']}" if above else ""
+
+    if behind <= 10:
+        return ("balanced", (
+            f"You are {behind} off the top and {catch}. Close enough that the "
+            f"template keeps you in touch. Take differentials where they are "
+            f"cheap in expected points, not as a gamble."))
+    if behind <= 30:
+        return ("lean aggressive", (
+            f"You are {behind} behind the leader and {catch}. Matching the "
+            f"field holds this gap, it does not close it. You need one or two "
+            f"players your rivals do not have, ideally with the fixtures to "
+            f"justify them on their own merits."))
+    return ("aggressive", (
+        f"You are {behind} behind the leader and {catch}. A gap this size does "
+        f"not close through good template management. It closes when players "
+        f"your rivals do not own return heavily and theirs do not. Accept the "
+        f"variance, because the safe route mathematically cannot catch up."))
+
+
+def captain_shortlist(my_picks, players, fixmap, next_gw, eo, limit=6):
+    """Rank your own players for the armband.
+
+    Deliberately does NOT add form and points-per-game together. Early in a
+    season they are computed from the same handful of matches, so weighting
+    both double counts one good afternoon. Underlying output per 90 carries the
+    weight instead, fixture modulates it, and the FPL projection breaks ties.
+    """
     rows = []
     for pid in my_picks:
         p = players.get(pid)
-        if not p or p["pos"] in ("GKP", "DEF"):
+        # Goalkeepers and defenders are not captaincy material. Their ceiling
+        # is a clean sheet and they cannot be rescued by a hat-trick.
+        if not p or p["pos"] in ("GKP", "DEF") or p["status"] != "a":
             continue
-        if p["status"] != "a":
+        if p["minutes"] < CAPTAIN_MIN_MINUTES:
             continue
         runs = fixmap.get(p["club"], [])
         nxt = next((r for r in runs if r[0] == next_gw), None)
         if not nxt:
             continue
         _, opp, fdr = nxt
-        # crude but effective: form carries most of the weight, fixture modulates
-        score = (p["form"] * 1.6) + (5 - fdr) * 1.4 + (p["ppg"] * 0.6)
+        # per-90 rates are only load bearing once there are enough minutes
+        # behind them. Before that, lean on the projection instead of
+        # pretending a tiny sample is a rate.
+        trusted = p["minutes"] >= XGI_TRUST_MINUTES
+        score = ((p["xgi90"] * 3.0) if trusted else 0.0) \
+            + ((5 - fdr) * 1.2) \
+            + (p["ep_next"] * (0.8 if trusted else 2.2))
         rows.append({
-            "name": p["name"], "club": p["club"], "opp": opp,
-            "fdr": fdr, "form": p["form"], "ppg": p["ppg"], "score": round(score, 2),
+            "id": pid, "name": p["name"], "club": p["club"], "opp": opp,
+            "fdr": fdr, "form": p["form"],
+            "xgi90": p["xgi90"] if trusted else None,
+            "ep": p["ep_next"], "eo": eo.get(pid, 0.0),
+            "score": round(score, 2),
         })
     rows.sort(key=lambda r: -r["score"])
     return rows[:limit]
+
+
+def recommend_captain(rows, stance):
+    """Pick from the shortlist in a way that matches the league situation."""
+    if not rows:
+        return None, ""
+    top = rows[0]
+
+    if stance in ("protect", "balanced"):
+        safe = max(rows[:3], key=lambda r: r["eo"])
+        if safe["id"] == top["id"]:
+            return top, (f"{top['name']} is both the strongest pick and the most "
+                         f"owned option here at {top['eo']:.0f}% effective "
+                         f"ownership. No reason to be clever.")
+        return safe, (f"{safe['name']} at {safe['eo']:.0f}% effective ownership. "
+                      f"{top['name']} scores slightly higher, but holding the "
+                      f"same armband as your rivals is the point from where you "
+                      f"are sitting.")
+
+    # Chasing: prefer lower effective ownership, but only among picks that are
+    # genuinely competitive on PROJECTED POINTS. Gating on the composite score
+    # lets a good fixture drag a low-ceiling player into contention, and then
+    # low ownership hands him the armband. That is how you end up captaining a
+    # defender projected for two points because nobody else owns him.
+    best_ep = max(r["ep"] for r in rows)
+    pool = [r for r in rows if r["ep"] >= CAPTAIN_EP_FLOOR * best_ep] or [top]
+    pick = min(pool, key=lambda r: r["eo"])
+
+    if pick["id"] == top["id"]:
+        if top["eo"] >= 100:
+            return top, (f"{top['name']} anyway. His {top['eo']:.0f}% effective "
+                         f"ownership means the armband gains you almost nothing "
+                         f"here, but nothing else on your bench is close enough "
+                         f"to justify the risk, and captaining a worse player to "
+                         f"be different loses more than it wins. Take him, and "
+                         f"find your edge in the other ten places.")
+        return top, (f"{top['name']} is the strongest pick and only "
+                     f"{top['eo']:.0f}% effective ownership. Best of both, take it.")
+
+    return pick, (f"{pick['name']} at {pick['eo']:.0f}% effective ownership "
+                  f"against {top['name']} at {top['eo']:.0f}%. {top['name']} "
+                  f"projects a little higher, but your rivals have him too, so a "
+                  f"haul from him barely moves you in this league.")
+
+
+def underlying_flags(my_picks, players):
+    """Who is riding luck and who is due, on expected goal involvement."""
+    over, under = [], []
+    for pid in my_picks:
+        p = players.get(pid)
+        if not p or p["minutes"] < UNDERLYING_MIN_MINUTES:
+            continue
+        if p["overperf"] >= 1.5:
+            over.append(p)
+        elif p["overperf"] <= -1.5:
+            under.append(p)
+    over.sort(key=lambda p: -p["overperf"])
+    under.sort(key=lambda p: p["overperf"])
+    return over, under
 
 
 def transfer_targets(sell_price, pos, players, fixmap, horizon, next_gw,
@@ -252,16 +591,17 @@ def transfer_targets(sell_price, pos, players, fixmap, horizon, next_gw,
             continue
         if p["price"] > sell_price + 1e-9:
             continue
-        if p["status"] != "a":
-            continue
-        if p["minutes"] < 45:          # must actually be playing
+        if p["status"] != "a" or p["minutes"] < 45:
             continue
         fsum, runs = fixture_score(p["club"], fixmap, horizon)
         nxt = next((r for r in runs if r[0] == next_gw), None)
-        score = (p["form"] * 1.5) + (p["ppg"] * 1.0) + (3 * horizon - fsum) * 0.35
+        x = trusted_xgi90(p)
+        score = ((x * 2.5) if x is not None else 0.0) \
+            + (p["ppg"] * (1.0 if x is not None else 2.0)) \
+            + (3 * horizon - fsum) * 0.35
         rows.append({
             "name": p["name"], "club": p["club"], "price": p["price"],
-            "owned": p["owned"], "form": p["form"], "ppg": p["ppg"],
+            "owned": p["owned"], "xgi90": x, "ppg": p["ppg"],
             "pts": p["points"], "fdr_sum": fsum,
             "next": nxt[1] if nxt else "-", "score": round(score, 2),
         })
@@ -283,13 +623,26 @@ def hours_until(iso):
 def render(ctx):
     L = []
     add = L.append
+    size = ctx["league_size"]
 
     add(f"# FPL brief: {ctx['today']}")
     add("")
-    add(f"**{ctx['league_name']}** | you are rank **{ctx['my_rank']}** of "
-        f"{ctx['league_size']} on {ctx['my_total']} pts | "
-        f"{ctx['gap_to_top']:+d} vs leader")
+    add(f"**{ctx['league_name']}** | {ctx['my_team_name']} is rank "
+        f"**{ctx['my_rank']}** of {size} on {ctx['my_total']} pts")
     add("")
+
+    # gaps that actually matter: the man above you, then the leader
+    bits = []
+    if ctx["gap_above"] is not None:
+        bits.append(f"{abs(ctx['gap_above'])} behind {ctx['above_name']} "
+                    f"in {ordinal(ctx['my_rank'] - 1)}")
+    if ctx["gap_below"] is not None:
+        bits.append(f"{abs(ctx['gap_below'])} ahead of {ctx['below_name']}")
+    if ctx["my_rank"] > 1:
+        bits.append(f"{abs(ctx['gap_leader'])} behind {ctx['leader_name']}")
+    if bits:
+        add(" | ".join(bits))
+        add("")
 
     hrs = ctx["hours_to_deadline"]
     if hrs is not None:
@@ -299,7 +652,7 @@ def render(ctx):
             add(f"## DEADLINE IN {hrs:.1f} HOURS (GW{ctx['next_gw']})")
         else:
             add(f"Deadline for GW{ctx['next_gw']}: **{ctx['deadline_local']}** "
-                f"({hrs/24:.1f} days away)")
+                f"({hrs / 24:.1f} days away)")
     add("")
     add(f"Bank: £{ctx['bank']:.1f}m | Squad value: £{ctx['value']:.1f}m")
     add("")
@@ -322,43 +675,102 @@ def render(ctx):
     if ctx["benchwarmers"]:
         urgent = True
         add("")
-        add("**Not playing at all (dead squad slots):**")
+        add("**Not playing (dead squad slots):**")
         for p in ctx["benchwarmers"]:
             add(f"- {p['name']} ({p['club']}) £{p['price']:.1f}m, "
-                f"{p['minutes']} mins all season")
+                f"{p['minutes']} mins across {ctx['finished_gws']} gameweeks, "
+                f"{p['starts']} starts")
     if not urgent:
         add("")
         add("Nothing urgent. Squad is fit and everyone is getting minutes.")
+        if ctx["finished_gws"] < EARLY_SEASON_GWS:
+            add("")
+            add(f"(Only {ctx['finished_gws']} gameweek(s) played, so minutes are "
+                f"not yet being judged. One benching is not a pattern.)")
     add("")
 
-    # ---- price movement
-    if ctx["rising"] or ctx["falling"]:
-        add("## Price watch")
-        for p, net in ctx["rising"]:
-            add(f"- {p['name']} rising ({net:+,} net transfers in). "
-                f"Buy now if you were going to.")
-        for p, net in ctx["falling"]:
-            add(f"- {p['name']} falling ({net:+,} net). "
-                f"Sell before the drop if you were going to.")
-        add("")
+    # ---- league position and what it implies
+    add("## Where you stand")
+    add("")
+    add(f"**Stance: {ctx['stance'].upper()}.** {ctx['stance_reason']}")
+    add("")
 
     # ---- captain
-    add(f"## Captain shortlist for GW{ctx['next_gw']}")
+    add(f"## Captain for GW{ctx['next_gw']}")
     add("")
-    add("| Player | Club | Opponent | FDR | Form | PPG |")
-    add("|---|---|---|---|---|---|")
+    if ctx["captain_pick"]:
+        add(f"**Pick: {ctx['captain_pick']['name']} "
+            f"({ctx['captain_pick']['club']} vs {ctx['captain_pick']['opp']}).** "
+            f"{ctx['captain_reason']}")
+        add("")
+    add("| Player | Club | Opponent | FDR | xGI/90 | Form | Proj | League EO |")
+    add("|---|---|---|---|---|---|---|---|")
     for r in ctx["captains"]:
         add(f"| {r['name']} | {r['club']} | {r['opp']} | {r['fdr']} | "
-            f"{r['form']} | {r['ppg']} |")
+            f"{r['xgi90'] if r['xgi90'] is not None else 'n/a'} | "
+            f"{r['form']} | {r['ep']} | {r['eo']:.0f}% |")
     add("")
+    add("League EO is effective ownership inside your mini-league: how much of "
+        "the field starts him, with captaincy counted twice and a triple "
+        "captain three times, so it can exceed 100%. High EO means a haul gains "
+        "you almost nothing here. xGI/90 shows n/a until a player has "
+        f"{XGI_TRUST_MINUTES} minutes behind the rate.")
+    add("")
+
+    # ---- underlying
+    if ctx["over"] or ctx["under"]:
+        add("## Underlying numbers")
+        add("")
+        if ctx["over"]:
+            add("**Scoring above their chances (regression risk):**")
+            for p in ctx["over"]:
+                add(f"- {p['name']}: {p['goals']}G {p['assists']}A from "
+                    f"{p['xgi']:.2f} xGI, {p['overperf']:+.2f} above expected")
+            add("")
+        if ctx["under"]:
+            add("**Creating more than they score (buy low):**")
+            for p in ctx["under"]:
+                add(f"- {p['name']}: {p['goals']}G {p['assists']}A from "
+                    f"{p['xgi']:.2f} xGI, {p['overperf']:+.2f} below expected")
+            add("")
+    elif ctx["finished_gws"] < 3:
+        add("## Underlying numbers")
+        add("")
+        add(f"Not enough minutes played yet for xG to say anything honest. "
+            f"Needs {UNDERLYING_MIN_MINUTES} minutes per player.")
+        add("")
+
+    # ---- price
+    if ctx["changed"] or ctx["rising"] or ctx["falling"] or ctx["movers"]:
+        add("## Price watch")
+        add("")
+        for p in ctx["changed"]:
+            d = p["cost_change_event"] / 10.0
+            add(f"- {p['name']} {'rose' if d > 0 else 'fell'} £{abs(d):.1f}m "
+                f"this gameweek, now £{p['price']:.1f}m.")
+        for p, net in ctx["rising"]:
+            add(f"- {p['name']} is being bought heavily ({net:+,} net). "
+                f"You own him, so this is team value accruing. Nothing to do.")
+        for p, net in ctx["falling"]:
+            add(f"- {p['name']} is being sold heavily ({net:+,} net) and looks "
+                f"likely to drop. Only act if you were selling anyway.")
+        if ctx["movers"]:
+            add("")
+            add("**Market is moving toward these, and you do not own them:**")
+            for p, net in ctx["movers"]:
+                x = trusted_xgi90(p)
+                tail = f", {x} xGI/90" if x is not None else ""
+                add(f"- {p['name']} ({p['club']}) £{p['price']:.1f}m, "
+                    f"{net:+,} net in{tail}")
+        add("")
 
     # ---- league intel
     add("## Mini-league intel")
     add("")
     if ctx["template"]:
-        add("**Owned by most of the league (captaining these gains you nothing):**")
+        add("**Template (you and most of the league own these):**")
         add("")
-        add(", ".join(f"{n} ({c}/{ctx['league_size']})" for n, c in ctx["template"]))
+        add(", ".join(f"{n} ({c}/{size}, {e:.0f}% EO)" for n, c, e in ctx["template"]))
         add("")
     if ctx["my_differentials"]:
         add("**Your differentials (nobody else in the league owns these):**")
@@ -366,9 +778,31 @@ def render(ctx):
         add(", ".join(ctx["my_differentials"]))
         add("")
     if ctx["leader_only"]:
-        add(f"**{ctx['leader_name']} owns, you don't:**")
+        add(f"**{ctx['leader_name']} owns, you do not:**")
         add("")
         add(", ".join(ctx["leader_only"]))
+        add("")
+
+    # ---- what rivals did
+    add("## Rival moves")
+    add("")
+    if ctx["chip_alerts"]:
+        add("**Chips played:**")
+        for line in ctx["chip_alerts"]:
+            add(f"- {line}")
+        add("")
+    if ctx["chips_used"]:
+        add("**Chips used so far this season:**")
+        for line in ctx["chips_used"]:
+            add(f"- {line}")
+        add("")
+    if ctx["rival_transfers"]:
+        add("**Transfers:**")
+        for line in ctx["rival_transfers"]:
+            add(f"- {line}")
+        add("")
+    if not (ctx["chip_alerts"] or ctx["chips_used"] or ctx["rival_transfers"]):
+        add("No chips played and no transfers made by anyone in the league yet.")
         add("")
 
     # ---- targets
@@ -378,18 +812,22 @@ def render(ctx):
             add("")
             add(f"**Replacing {slot}:**")
             add("")
-            add("| Player | Club | £ | Owned% | Form | Next | FDR sum |")
-            add("|---|---|---|---|---|---|---|")
+            add("| Player | Club | £ | Owned% | xGI/90 | PPG | Next | FDR sum |")
+            add("|---|---|---|---|---|---|---|---|")
             for r in rows:
                 add(f"| {r['name']} | {r['club']} | {r['price']:.1f} | "
-                    f"{r['owned']} | {r['form']} | {r['next']} | {r['fdr_sum']} |")
+                    f"{r['owned']} | "
+                    f"{r['xgi90'] if r['xgi90'] is not None else 'n/a'} | "
+                    f"{r['ppg']} | {r['next']} | {r['fdr_sum']} |")
         add("")
 
     add("---")
     add("")
-    add("Generated automatically. Fixture difficulty is the official FDR, which is "
-        "crude. Form is last 30 days. Nothing here accounts for team news that "
-        "broke in the last hour, so check press conferences before the deadline.")
+    add("Generated automatically. Effective ownership is based on the last "
+        "completed gameweek, since upcoming teams are hidden until the "
+        "deadline. Fixture difficulty is the official FDR, which is crude. "
+        "Nothing here accounts for team news that broke in the last hour, so "
+        "check press conferences before the deadline.")
     return "\n".join(L)
 
 
@@ -405,7 +843,7 @@ def main():
                          "(default: stdout)")
     args = ap.parse_args()
 
-    boot, teams, players, fixtures, current, nxt = load_core()
+    boot, teams, players, fixtures, current, nxt, finished_gws = load_core()
     next_gw = nxt["id"]
     last_gw = current["id"] if current else max(1, next_gw - 1)
 
@@ -426,43 +864,92 @@ def main():
                  f"(or its GW{last_gw} picks are not public yet).")
     my_picks = me["picks"]
 
-    injured, doubtful, benchwarmers = squad_alerts(my_picks, players)
-    rising, falling = price_watch(my_picks, players, players)
-    owners = league_ownership(squads, args.entry)
+    owners, eo = ownership_and_eo(squads)
+    pos = league_position(squads, args.entry)
+    stance, stance_reason = risk_stance(pos)
     size = len(squads)
 
+    injured, doubtful, benchwarmers = squad_alerts(my_picks, players, finished_gws)
+    rising, falling, changed = price_watch(my_picks, players, players)
+    movers = market_movers(players, my_picks)
+    over, under = underlying_flags(my_picks, players)
+
+    captains = captain_shortlist(my_picks, players, fixmap, next_gw, eo)
+    captain_pick, captain_reason = recommend_captain(captains, stance)
+
     template = sorted(
-        [(players[pid]["name"], len(v)) for pid, v in owners.items()
-         if len(v) >= max(3, size // 2) and pid in my_picks],
+        [(players[pid]["name"], len(v), eo.get(pid, 0.0))
+         for pid, v in owners.items()
+         if len(v) > size / 2 and pid in my_picks],
         key=lambda x: -x[1])
 
     my_differentials = [players[pid]["name"] for pid in my_picks
                         if len(owners.get(pid, [])) == 1
-                        and players[pid]["minutes"] >= 45]
+                        and players[pid]["minutes"] >= 45
+                        and players[pid]["status"] == "a"]
 
-    leader = min(squads.values(), key=lambda s: s["rank"])
-    leader_only = [players[pid]["name"] for pid in leader["picks"]
-                   if pid not in my_picks]
+    leader = pos["leader"]
+    leader_only = [f"{players[pid]['name']} ({players[pid]['points']} pts)"
+                   for pid in sorted(
+                       [q for q in leader["picks"] if q not in my_picks],
+                       key=lambda q: -players[q]["points"])[:6]]
 
-    captains = captain_shortlist(my_picks, players, fixmap, next_gw)
+    # ---- what the rest of the league actually did
+    chips_hist = load_chip_history(standings)
+    recent = load_recent_transfers(standings, players, [last_gw, next_gw])
 
-    # replacement options for anything flagged as dead weight or injured
+    def who_is(eid):
+        return "You" if eid == args.entry else squads.get(eid, {}).get("name", str(eid))
+
+    chip_alerts = []
+    for eid, sq in squads.items():
+        if sq["chip"]:
+            chip_alerts.append(f"{who_is(eid)} played {chip_label(sq['chip'])} "
+                               f"in GW{last_gw}.")
+
+    chips_used = []
+    for eid, used in chips_hist.items():
+        if used:
+            chips_used.append(f"{who_is(eid)}: " + ", ".join(
+                f"{chip_label(n)} (GW{g})" for n, g in used))
+
+    rival_transfers = []
+    for eid, by_gw in recent.items():
+        for gw in sorted(by_gw):
+            moves = ", ".join(f"{o} -> {i}" for o, i in by_gw[gw])
+            tag = "already made for" if gw == next_gw else "in"
+            rival_transfers.append(f"{who_is(eid)} {tag} GW{gw}: {moves}")
+
+    # ---- replacement options, grouped so identical budgets share one table
+    groups = {}
+    for p in (injured + benchwarmers)[:4]:
+        groups.setdefault((p["pos"], round(p["price"] + bank, 1)), []).append(p)
+
     targets = {}
-    for p in (benchwarmers + injured)[:3]:
-        rows = transfer_targets(p["price"] + bank, p["pos"], players, fixmap,
+    for (pos_code, budget), plist in list(groups.items())[:3]:
+        rows = transfer_targets(budget, pos_code, players, fixmap,
                                 args.horizon, next_gw, set(my_picks))
         if rows:
-            targets[f"{p['name']} (£{p['price']:.1f}m + £{bank:.1f}m bank)"] = rows
+            names = " or ".join(p["name"] for p in plist)
+            targets[f"{names} ({pos_code}, £{budget:.1f}m to spend)"] = rows
 
     dl = nxt.get("deadline_time")
     ctx = {
         "today": dt.date.today().isoformat(),
         "league_name": league_name,
         "league_size": size,
-        "my_rank": me["rank"],
+        "finished_gws": finished_gws,
+        "my_rank": pos["rank"],
         "my_total": me["total"],
-        "gap_to_top": me["total"] - leader["total"],
+        "my_team_name": me["name"],
         "leader_name": leader["name"],
+        "above_name": pos["above"]["name"] if pos["above"] else None,
+        "below_name": pos["below"]["name"] if pos["below"] else None,
+        "gap_leader": pos["gap_leader"],
+        "gap_above": pos["gap_above"],
+        "gap_below": pos["gap_below"],
+        "stance": stance,
+        "stance_reason": stance_reason,
         "next_gw": next_gw,
         "deadline_local": dl,
         "hours_to_deadline": hours_until(dl),
@@ -473,16 +960,28 @@ def main():
         "benchwarmers": benchwarmers,
         "rising": rising,
         "falling": falling,
+        "changed": changed,
+        "movers": movers,
+        "over": over,
+        "under": under,
         "captains": captains,
+        "captain_pick": captain_pick,
+        "captain_reason": captain_reason,
         "template": template,
         "my_differentials": my_differentials,
         "leader_only": leader_only,
+        "chip_alerts": chip_alerts,
+        "chips_used": chips_used,
+        "rival_transfers": rival_transfers,
         "targets": targets,
     }
 
     text = render(ctx)
     if args.out:
         out_path = args.out.replace("{date}", dt.date.today().isoformat())
+        parent = os.path.dirname(os.path.abspath(out_path))
+        if parent:
+            os.makedirs(parent, exist_ok=True)
         with open(out_path, "w", encoding="utf-8") as fh:
             fh.write(text)
         print(f"Wrote {os.path.abspath(out_path)}")
