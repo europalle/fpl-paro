@@ -422,7 +422,11 @@ def ownership_and_eo(squads):
 
 
 def league_position(squads, my_entry):
-    ordered = sorted(squads.items(), key=lambda kv: (kv[1]["rank"], -kv[1]["total"]))
+    # Entry id is the final tiebreak purely so the ordering is STABLE. Without
+    # it, two managers level on points swap places between runs and the brief
+    # reports a different rank each day from identical data.
+    ordered = sorted(squads.items(),
+                     key=lambda kv: (kv[1]["rank"], -kv[1]["total"], kv[0]))
     ids = [eid for eid, _ in ordered]
     if my_entry not in ids:
         return None
@@ -431,8 +435,13 @@ def league_position(squads, my_entry):
     leader = ordered[0][1]
     above = ordered[idx - 1][1] if idx > 0 else None
     below = ordered[idx + 1][1] if idx < len(ordered) - 1 else None
+    tied = [sq["name"] for eid, sq in ordered
+            if eid != my_entry and sq["total"] == me["total"]]
     return {
-        "rank": idx + 1,
+        # FPL's own rank, not our index into the sorted list. When two managers
+        # are level, our index is arbitrary and theirs is not.
+        "rank": me["rank"],
+        "tied_with": tied,
         "size": len(ordered),
         "me": me,
         "leader": leader,
@@ -463,7 +472,12 @@ def risk_stance(pos):
             f"your lead does the rest. Differentials are how leads get thrown "
             f"away, not defended."))
 
-    catch = f"{abs(gap_above)} points behind {above['name']}" if above else ""
+    if not above:
+        catch = ""
+    elif gap_above == 0:
+        catch = f"level on points with {above['name']}"
+    else:
+        catch = f"{abs(gap_above)} points behind {above['name']}"
 
     if behind <= 10:
         return ("balanced", (
@@ -634,14 +648,20 @@ def render(ctx):
     # gaps that actually matter: the man above you, then the leader
     bits = []
     if ctx["gap_above"] is not None:
-        bits.append(f"{abs(ctx['gap_above'])} behind {ctx['above_name']} "
-                    f"in {ordinal(ctx['my_rank'] - 1)}")
+        bits.append(f"level with {ctx['above_name']}" if ctx["gap_above"] == 0
+                    else f"{abs(ctx['gap_above'])} behind {ctx['above_name']}")
     if ctx["gap_below"] is not None:
-        bits.append(f"{abs(ctx['gap_below'])} ahead of {ctx['below_name']}")
+        bits.append(f"level with {ctx['below_name']}" if ctx["gap_below"] == 0
+                    else f"{abs(ctx['gap_below'])} ahead of {ctx['below_name']}")
     if ctx["my_rank"] > 1:
         bits.append(f"{abs(ctx['gap_leader'])} behind {ctx['leader_name']}")
     if bits:
         add(" | ".join(bits))
+        add("")
+    if ctx["tied_with"]:
+        add(f"Level on points with {', '.join(ctx['tied_with'])}. FPL splits "
+            f"you on its own tiebreak, so the position between you can move "
+            f"without either of you scoring.")
         add("")
 
     hrs = ctx["hours_to_deadline"]
@@ -942,6 +962,7 @@ def main():
         "my_rank": pos["rank"],
         "my_total": me["total"],
         "my_team_name": me["name"],
+        "tied_with": pos["tied_with"],
         "leader_name": leader["name"],
         "above_name": pos["above"]["name"] if pos["above"] else None,
         "below_name": pos["below"]["name"] if pos["below"] else None,
