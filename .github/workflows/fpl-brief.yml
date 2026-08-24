@@ -1,0 +1,49 @@
+name: FPL daily brief
+
+on:
+  schedule:
+    # 14:45 UTC daily. That is 16:45 Copenhagen in summer, 15:45 in winter.
+    # Deliberately ~20 minutes before the Claude scheduled task reads it.
+    - cron: "45 14 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fpl-brief
+  cancel-in-progress: false
+
+jobs:
+  brief:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Generate brief
+        run: |
+          mkdir -p briefs
+          python3 fpl_brief.py \
+            --entry 8876628 \
+            --league 1840250 \
+            --out "briefs/brief-{date}.md"
+
+      - name: Commit brief
+        run: |
+          git config user.name  "fpl-brief bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add briefs/
+          if git diff --staged --quiet; then
+            echo "No change in today's brief, nothing to commit."
+          else
+            git commit -m "FPL brief $(date -u +%Y-%m-%d)"
+            git push
+          fi
