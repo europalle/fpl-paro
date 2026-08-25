@@ -699,6 +699,120 @@ def underlying_flags(my_picks, players):
     return over, under
 
 
+def lineup_check(my_squad, players, fixmap, next_gw):
+    """Problems in the eleven you actually started, not just the squad.
+
+    A flagged player on the bench is nothing. The same player starting is
+    points on the floor, and auto-subs will not save you: they only fire when
+    someone records zero minutes, so a player who limps through twenty and
+    blanks costs you the full slot with no safety net.
+    """
+    starters = set(my_squad["starters"])
+    bench = [pid for pid in my_squad["picks"] if pid not in starters]
+
+    flagged, blanks, swaps = [], [], []
+
+    for pid in my_squad["starters"]:
+        p = players.get(pid)
+        if not p:
+            continue
+        if p["status"] in ("i", "s", "u", "d"):
+            flagged.append(p)
+        has_fixture = any(r[0] == next_gw for r in fixmap.get(p["club"], []))
+        if not has_fixture:
+            blanks.append(p)
+
+    # Only ever suggest a like-for-like swap, so the formation stays legal.
+    problems = {p["id"] for p in flagged + blanks}
+    for prob_id in problems:
+        prob = players[prob_id]
+        for bid in bench:
+            b = players.get(bid)
+            if not b or b["pos"] != prob["pos"] or b["status"] != "a":
+                continue
+            if not any(r[0] == next_gw for r in fixmap.get(b["club"], [])):
+                continue
+            if b["minutes"] < CAPTAIN_MIN_MINUTES:
+                continue
+            swaps.append((prob, b))
+            break
+
+    return flagged, blanks, swaps
+
+
+def rival_captains(squads, my_entry, players):
+    """Who the league actually captained, and whether they agreed."""
+    rows, tally = [], defaultdict(int)
+    for eid, sq in squads.items():
+        cid = sq.get("captain")
+        name = players.get(cid, {}).get("name", "unknown") if cid else "unknown"
+        who = "You" if eid == my_entry else sq["name"]
+        rows.append((who, name, sq.get("chip")))
+        tally[name] += 1
+    rows.sort(key=lambda r: (r[0] != "You", r[0]))
+    consensus = max(tally.items(), key=lambda kv: kv[1]) if tally else (None, 0)
+    return rows, consensus, len(squads)
+
+
+def fixture_outlook(my_picks, players, fixmap, horizon, next_gw):
+    """Where your squad's fixtures turn, and any blanks or doubles ahead."""
+    clubs = {}
+    for pid in my_picks:
+        p = players.get(pid)
+        if not p:
+            continue
+        clubs.setdefault(p["club"], []).append(p["name"])
+
+    rows, blanks, doubles = [], [], []
+    for club, names in clubs.items():
+        runs = fixmap.get(club, [])
+        per_gw = defaultdict(list)
+        for gw, opp, fdr in runs:
+            per_gw[gw].append((opp, fdr))
+
+        fdrs, cells = [], []
+        for gw in range(next_gw, next_gw + horizon):
+            games = per_gw.get(gw, [])
+            if len(games) == 0:
+                blanks.append((club, gw, names))
+                # A blank is worse than any fixture, so it scores as one.
+                fdrs.append(5)
+                cells.append("-")
+            else:
+                if len(games) > 1:
+                    doubles.append((club, gw, names, len(games)))
+                fdrs.extend(f for _, f in games)
+                cells.append("+".join(str(f) for _, f in games))
+
+        avg = sum(fdrs) / max(len(fdrs), 1)
+        seq = " ".join(cells)
+        rows.append({"club": club, "players": names, "avg": round(avg, 2),
+                     "seq": seq, "count": len(fdrs)})
+
+    rows.sort(key=lambda r: r["avg"])
+    return rows, blanks, doubles
+
+
+def threats(owners, eo, my_picks, players, size, limit=6):
+    """High effective ownership players you do NOT have.
+
+    Your differentials are what you gain with. These are what you lose to.
+    """
+    mine = set(my_picks)
+    rows = []
+    for pid, holders in owners.items():
+        if pid in mine or len(holders) < 2:
+            continue
+        p = players.get(pid)
+        if not p:
+            continue
+        rows.append({"name": p["name"], "club": p["club"], "price": p["price"],
+                     "count": len(holders), "eo": eo.get(pid, 0.0),
+                     "holders": holders})
+    rows.sort(key=lambda r: -r["eo"])
+    return rows[:limit]
+
+
 def transfer_targets(sell_price, pos, players, fixmap, horizon, next_gw,
                      exclude_ids, limit=8):
     """Best available replacements at or under the budget."""
@@ -812,6 +926,28 @@ def render(ctx):
                 f"not yet being judged. One benching is not a pattern.)")
     add("")
 
+    # ---- lineup problems, which cost points directly
+    if ctx["flagged_starters"] or ctx["blank_starters"] or ctx["swaps"]:
+        add(f"## Your eleven (as submitted in GW{ctx['last_gw']})")
+        add("")
+        for p in ctx["flagged_starters"]:
+            state = "unavailable" if p["status"] != "d" else f"{p['chance']}% doubt"
+            add(f"- **{p['name']}** is starting and is {state}. Auto-subs only "
+                f"cover a player who records zero minutes, so if he starts and "
+                f"blanks you lose the slot with nothing coming on.")
+        for p in ctx["blank_starters"]:
+            add(f"- **{p['name']}** ({p['club']}) is starting and has no fixture "
+                f"in GW{ctx['next_gw']}. That is a guaranteed zero.")
+        for prob, sub in ctx["swaps"]:
+            add(f"- Straight swap available: {sub['name']} ({sub['club']}) is fit, "
+                f"playing, and the same position as {prob['name']}. Formation "
+                f"stays legal.")
+        add("")
+        add(f"This reads your GW{ctx['last_gw']} team, the last one FPL makes "
+            f"public. If you have already changed it, ignore what no longer "
+            f"applies.")
+        add("")
+
     # ---- league position and what it implies
     add("## Where you stand")
     add("")
@@ -919,9 +1055,76 @@ def render(ctx):
         add(", ".join(ctx["leader_only"]))
         add("")
 
+    # ---- fixtures ahead
+    if ctx["outlook"]:
+        add(f"## Fixtures, next {ctx['horizon']} gameweeks")
+        add("")
+        add("| Club | Your players | FDR by GW | Avg |")
+        add("|---|---|---|---|")
+        for r in ctx["outlook"]:
+            add(f"| {r['club']} | {', '.join(r['players'])} | `{r['seq']}` | "
+                f"{r['avg']} |")
+        add("")
+        add("Best runs at the top, worst at the bottom. A dash is a blank "
+            "gameweek and a plus joins two fixtures in the same one.")
+        add("")
+        if ctx["blanks"]:
+            add("**Blank gameweeks coming:**")
+            for club, gw, names in ctx["blanks"]:
+                add(f"- {club} have no GW{gw} fixture: {', '.join(names)}")
+            add("")
+        if ctx["doubles"]:
+            add("**Double gameweeks coming:**")
+            for club, gw, names, cnt in ctx["doubles"]:
+                add(f"- {club} play {cnt} times in GW{gw}: {', '.join(names)}")
+            add("")
+
+    # ---- who can hurt you
+    if ctx["threats"]:
+        add("## Threats")
+        add("")
+        add("Players you do not own that most of the league does. These are "
+            "what you lose ground to.")
+        add("")
+        add("| Player | Club | £ | Owned by | League EO |")
+        add("|---|---|---|---|---|")
+        for t in ctx["threats"]:
+            add(f"| {t['name']} | {t['club']} | {t['price']:.1f} | "
+                f"{t['count']}/{size} | {t['eo']:.0f}% |")
+        add("")
+
     # ---- what rivals did
     add("## Rival moves")
     add("")
+    if ctx["captain_rows"]:
+        add("**Who captained what in GW" + str(ctx["last_gw"]) + ":**")
+        add("")
+        for who, name, chip in ctx["captain_rows"]:
+            tag = f" ({chip_label(chip)})" if chip else ""
+            add(f"- {who}: {name}{tag}")
+        cname, ccount = ctx["consensus"]
+        if cname and ccount >= max(3, size // 2 + 1):
+            add("")
+            add(f"{ccount} of {size} went {cname}. Captaining him is holding "
+                f"station, not gaining. Beating that field means someone else "
+                f"outscoring him, not matching him.")
+        elif cname and ccount <= 2:
+            add("")
+            add("The league is split on the armband. That is where positions "
+                "actually move.")
+        add("")
+    if ctx["my_chips_used"]:
+        add(f"**Your chips used so far:** {ctx['my_chips_used']}")
+        add("")
+    if ctx["bench_pts"]:
+        add(f"**You left {ctx['bench_pts']} points on your bench in "
+            f"GW{ctx['last_gw']}.**")
+        add("")
+    if ctx["hits"]:
+        add("**Hits taken:**")
+        for line in ctx["hits"]:
+            add(f"- {line}")
+        add("")
     if ctx["chip_alerts"]:
         add("**Chips played:**")
         for line in ctx["chip_alerts"]:
@@ -1016,6 +1219,13 @@ def main():
                    if players[pid]["minutes"] < XGI_TRUST_MINUTES]
     priors = load_last_season(needs_prior) if needs_prior else {}
     captains = captain_shortlist(my_picks, players, fixmap, next_gw, eo, priors)
+
+    flagged_starters, blank_starters, swaps = lineup_check(
+        me, players, fixmap, next_gw)
+    captain_rows, consensus, _ = rival_captains(squads, args.entry, players)
+    outlook, blanks, doubles = fixture_outlook(
+        my_picks, players, fixmap, args.horizon, next_gw)
+    threat_rows = threats(owners, eo, my_picks, players, size)
     captain_pick, captain_reason = recommend_captain(captains, stance)
 
     template = sorted(
@@ -1053,6 +1263,15 @@ def main():
         if used:
             chips_used.append(f"{who_is(eid)}: " + ", ".join(
                 f"{chip_label(n)} (GW{g})" for n, g in used))
+
+    my_chips_used = ", ".join(
+        f"{chip_label(cn)} (GW{cg})" for cn, cg in chips_hist.get(args.entry, []))
+
+    hits = []
+    for eid, sq in squads.items():
+        if sq.get("hit"):
+            hits.append(f"{who_is(eid)} took a {sq['hit']} point hit in "
+                        f"GW{last_gw} for {sq.get('transfers', 0)} transfers.")
 
     rival_transfers = []
     for eid, by_gw in recent.items():
@@ -1112,6 +1331,20 @@ def main():
         "template": template,
         "my_differentials": my_differentials,
         "leader_only": leader_only,
+        "last_gw": last_gw,
+        "horizon": args.horizon,
+        "flagged_starters": flagged_starters,
+        "blank_starters": blank_starters,
+        "swaps": swaps,
+        "captain_rows": captain_rows,
+        "consensus": consensus,
+        "my_chips_used": my_chips_used,
+        "bench_pts": me.get("bench_pts", 0),
+        "hits": hits,
+        "outlook": outlook,
+        "blanks": blanks,
+        "doubles": doubles,
+        "threats": threat_rows,
         "chip_alerts": chip_alerts,
         "chips_used": chips_used,
         "rival_transfers": rival_transfers,
