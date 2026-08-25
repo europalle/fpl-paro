@@ -58,6 +58,11 @@ XGI_TRUST_MINUTES = 270
 # A player needs to be an actual starter to be worth captaining.
 CAPTAIN_MIN_MINUTES = 45
 
+# Minutes a player needed LAST season before their scoring rate counts as a
+# prior worth using. Ten full matches. Below that it is another small sample
+# being treated as a fact.
+PRIOR_MIN_LAST_SEASON_MINUTES = 900
+
 # A differential captain must still project within this fraction of the best
 # projected score available. Below it, you are not taking a calculated risk,
 # you are just captaining a worse player.
@@ -386,6 +391,49 @@ def price_watch(my_picks, players, all_players):
     return rising, falling, changed
 
 
+def price_prior(p):
+    """Crude quality prior from price, for players with no usable history.
+
+    FPL prices encode a lot of consensus. A fifteen million forward is expected
+    to outscore a four and a half million defender and the market is rarely
+    wrong about that much. Maps roughly onto points per 90.
+    """
+    return round(1.5 + max(p["price"] - 4.0, 0.0) * 0.45, 2)
+
+
+def load_last_season(player_ids):
+    """element id -> last season's points per 90, where the API has one.
+
+    Costs one call per candidate, so it is only ever asked for the handful of
+    players who could realistically wear the armband, never the whole game.
+    """
+    out = {}
+    for pid in player_ids:
+        time.sleep(THROTTLE)
+        try:
+            data = get(f"element-summary/{pid}/")
+        except (urllib.error.HTTPError, urllib.error.URLError):
+            continue
+        past = data.get("history_past") or []
+        if not past:
+            continue
+        last = past[-1]
+        mins = last.get("minutes") or 0
+        if mins < PRIOR_MIN_LAST_SEASON_MINUTES:
+            continue
+        out[pid] = round((last.get("total_points") or 0) * 90.0 / mins, 2)
+    return out
+
+
+def captain_candidate_ids(my_picks, players):
+    """Who could plausibly be captained, so we only fetch priors for them."""
+    return [pid for pid in my_picks
+            if (p := players.get(pid))
+            and p["pos"] not in ("GKP", "DEF")
+            and p["status"] == "a"
+            and p["minutes"] >= CAPTAIN_MIN_MINUTES]
+
+
 def trusted_xgi90(p):
     """xGI/90 only when there are enough minutes behind it, else None.
 
@@ -527,7 +575,8 @@ def risk_stance(pos, finished_gws, total_gws):
         f"route runs out of road."))
 
 
-def captain_shortlist(my_picks, players, fixmap, next_gw, eo, limit=6):
+def captain_shortlist(my_picks, players, fixmap, next_gw, eo, priors=None,
+                      limit=6):
     """Rank your own players for the armband.
 
     Deliberately does NOT add form and points-per-game together. Early in a
@@ -553,14 +602,30 @@ def captain_shortlist(my_picks, players, fixmap, next_gw, eo, limit=6):
         # behind them. Before that, lean on the projection instead of
         # pretending a tiny sample is a rate.
         trusted = p["minutes"] >= XGI_TRUST_MINUTES
-        score = ((p["xgi90"] * 3.0) if trusted else 0.0) \
-            + ((5 - fdr) * 1.2) \
-            + (p["ep_next"] * (0.8 if trusted else 2.2))
+        prior = (priors or {}).get(pid)
+        prior_src = "last season" if prior is not None else "price"
+        if prior is None:
+            prior = price_prior(p)
+
+        if trusted:
+            score = (p["xgi90"] * 3.0) + ((5 - fdr) * 1.2) + (p["ep_next"] * 0.8)
+        else:
+            # Early season, ep_next is the only forward-looking number and it is
+            # visibly unreliable: it has rated a player on 11.0 form at 2.4 while
+            # rating a 2.0 form player at 4.0. Spreading the weight across the
+            # projection, recent form and a season-long prior means no single
+            # bad input can hand out the armband on its own.
+            score = ((5 - fdr) * 1.2) \
+                + (p["ep_next"] * 0.9) \
+                + (p["form"] * 0.5) \
+                + (prior * 2.0)
+
         rows.append({
             "id": pid, "name": p["name"], "club": p["club"], "opp": opp,
             "fdr": fdr, "form": p["form"],
             "xgi90": p["xgi90"] if trusted else None,
             "ep": p["ep_next"], "eo": eo.get(pid, 0.0),
+            "prior": prior, "prior_src": prior_src, "trusted": trusted,
             "score": round(score, 2),
         })
     rows.sort(key=lambda r: -r["score"])
@@ -595,8 +660,10 @@ def recommend_captain(rows, stance):
     # lets a good fixture drag a low-ceiling player into contention, and then
     # low ownership hands him the armband. That is how you end up captaining a
     # defender projected for two points because nobody else owns him.
-    best_ep = max(r["ep"] for r in rows)
-    pool = [r for r in rows if r["ep"] >= CAPTAIN_EP_FLOOR * best_ep] or [top]
+    # Gate on the same blended score the table is ranked by. Gating on ep_next
+    # alone would re-import the exact unreliability the blend exists to dilute.
+    best = max(r["score"] for r in rows)
+    pool = [r for r in rows if r["score"] >= CAPTAIN_EP_FLOOR * best] or [top]
     pick = min(pool, key=lambda r: r["eo"])
 
     if pick["id"] == top["id"]:
@@ -759,18 +826,25 @@ def render(ctx):
             f"({ctx['captain_pick']['club']} vs {ctx['captain_pick']['opp']}).** "
             f"{ctx['captain_reason']}")
         add("")
-    add("| Player | Club | Opponent | FDR | xGI/90 | Form | Proj | League EO |")
-    add("|---|---|---|---|---|---|---|---|")
+    add("| Player | Club | Opponent | FDR | xGI/90 | Form | Proj | Prior | League EO |")
+    add("|---|---|---|---|---|---|---|---|---|")
     picked_id = ctx["captain_pick"]["id"] if ctx["captain_pick"] else None
     for r in ctx["captains"]:
         chosen = r["id"] == picked_id
         label = f"**{r['name']} (pick)**" if chosen else r["name"]
+        prior = f"{r['prior']}{'*' if r['prior_src'] == 'price' else ''}"
         add(f"| {label} | {r['club']} | {r['opp']} | {r['fdr']} | "
             f"{r['xgi90'] if r['xgi90'] is not None else 'n/a'} | "
-            f"{r['form']} | {r['ep']} | {r['eo']:.0f}% |")
+            f"{r['form']} | {r['ep']} | {prior} | {r['eo']:.0f}% |")
     add("")
     add("Rows are ordered by overall score, so the recommended pick is not "
-        "always the top line. When it is not, the reasoning above says why.")
+        "always the top line. When it is not, the reasoning above says why. "
+        "Prior is last season's points per 90; a * means that player had no "
+        "usable last season and the figure is estimated from price instead. "
+        "Until a player passes "
+        f"{XGI_TRUST_MINUTES} minutes this season, the ranking blends the "
+        "projection, recent form and that prior rather than trusting FPL's "
+        "projection alone, which is erratic in August.")
     add("")
     add("League EO is effective ownership inside your mini-league: how much of "
         "the field starts him, with captaincy counted twice and a triple "
@@ -937,7 +1011,11 @@ def main():
     movers = market_movers(players, my_picks)
     over, under = underlying_flags(my_picks, players)
 
-    captains = captain_shortlist(my_picks, players, fixmap, next_gw, eo)
+    candidates = captain_candidate_ids(my_picks, players)
+    needs_prior = [pid for pid in candidates
+                   if players[pid]["minutes"] < XGI_TRUST_MINUTES]
+    priors = load_last_season(needs_prior) if needs_prior else {}
+    captains = captain_shortlist(my_picks, players, fixmap, next_gw, eo, priors)
     captain_pick, captain_reason = recommend_captain(captains, stance)
 
     template = sorted(
