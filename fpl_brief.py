@@ -138,7 +138,7 @@ def get(path, retries=3):
 EXPECTED_ELEMENT_FIELDS = [
     "expected_goals", "expected_assists", "expected_goal_involvements",
     "ep_next", "starts", "transfers_in_event", "transfers_out_event",
-    "cost_change_event", "goals_scored", "assists",
+    "cost_change_event", "cost_change_start", "goals_scored", "assists",
 ]
 
 
@@ -193,6 +193,7 @@ def load_core():
             "in_event": p.get("transfers_in_event", 0),
             "out_event": p.get("transfers_out_event", 0),
             "cost_change_event": p.get("cost_change_event", 0),
+            "cost_change_start": p.get("cost_change_start", 0),
             "starts": p.get("starts", 0),
             "goals": goals,
             "assists": assists,
@@ -813,6 +814,120 @@ def threats(owners, eo, my_picks, players, size, limit=6):
     return rows[:limit]
 
 
+def sell_estimate(p):
+    """Best available guess at what FPL would refund you.
+
+    Selling returns your purchase price plus HALF of any rise, rounded down to
+    the nearest 0.1. Your actual purchase prices live behind an authenticated
+    endpoint, so this assumes you have held since the season opened, which is
+    right for most of a squad early on and drifts once you start trading.
+    A price that has FALLEN is taken in full, there is no half-loss.
+    """
+    now = p["price"]
+    drift = p.get("cost_change_start", 0) / 10.0
+    if drift <= 0:
+        return now
+    purchase = now - drift
+    return round(purchase + (int(drift * 10) // 2) / 10.0, 1)
+
+
+def value_audit(my_picks, players, finished_gws, limit=3):
+    """Holdings returning least for what they cost.
+
+    Ignores genuine cheap enablers: a 4.0m defender is not underperforming his
+    price, that is the entire job. Only meaningful once enough football has
+    been played for points totals to mean something.
+    """
+    if finished_gws < EARLY_SEASON_GWS:
+        return []
+    rows = []
+    for pid in my_picks:
+        p = players.get(pid)
+        if not p or p["price"] < 5.5:
+            continue
+        ppm = p["points"] / p["price"] if p["price"] else 0.0
+        rows.append({"p": p, "ppm": round(ppm, 2),
+                     "sell": sell_estimate(p)})
+    rows.sort(key=lambda r: r["ppm"])
+    return rows[:limit]
+
+
+def downgrade_candidates(weak_p, sell, players, my_picks, min_saving=1.0):
+    """Cheaper players in the same position who are actually playing."""
+    out = []
+    for p in players.values():
+        if p["id"] in my_picks or p["pos"] != weak_p["pos"]:
+            continue
+        if p["status"] != "a" or p["minutes"] < 45:
+            continue
+        if p["price"] > sell - min_saving:
+            continue
+        out.append(p)
+    out.sort(key=lambda p: -p["ppg"])
+    return out[:3]
+
+
+def best_upgrade(freed, my_picks, players, fixmap, next_gw, exclude=frozenset(),
+                 limit=3):
+    """What the freed cash actually buys you, across the whole squad.
+
+    Money is only worth what you spend it on, so this asks the real question:
+    given this much extra, which single swap improves the squad most?
+    """
+    out = []
+    for pid in my_picks:
+        mine = players.get(pid)
+        if not mine or mine["status"] != "a":
+            continue
+        budget = mine["price"] + freed
+        for cand in players.values():
+            # exclude holds the player being sold and his replacement. Without
+            # it the plan cheerfully recommends buying back the man it just
+            # told you to sell, using the money from selling him.
+            if cand["id"] in my_picks or cand["id"] in exclude:
+                continue
+            if cand["pos"] != mine["pos"]:
+                continue
+            if cand["price"] > budget or cand["status"] != "a":
+                continue
+            if cand["minutes"] < 45:
+                continue
+            gain = cand["ppg"] - mine["ppg"]
+            if gain <= 0:
+                continue
+            out.append({"out": mine, "in": cand, "gain": round(gain, 2),
+                        "cost": round(cand["price"] - mine["price"], 1)})
+    out.sort(key=lambda r: -r["gain"])
+    seen, dedup = set(), []
+    for r in out:
+        if r["out"]["id"] in seen:
+            continue
+        seen.add(r["out"]["id"])
+        dedup.append(r)
+    return dedup[:limit]
+
+
+def funding_plans(my_picks, players, fixmap, next_gw, bank, finished_gws):
+    """Restructures worth considering: sell weak, downgrade, spend the difference."""
+    plans = []
+    for row in value_audit(my_picks, players, finished_gws):
+        weak, sell = row["p"], row["sell"]
+        for cheap in downgrade_candidates(weak, sell, players, set(my_picks)):
+            freed = round(sell - cheap["price"] + bank, 1)
+            if freed < 0.5:
+                continue
+            ups = best_upgrade(freed,
+                                [q for q in my_picks if q != weak["id"]],
+                                players, fixmap, next_gw,
+                                exclude={weak["id"], cheap["id"]})
+            if not ups:
+                continue
+            plans.append({"weak": weak, "sell": sell, "cheap": cheap,
+                          "freed": freed, "ppm": row["ppm"], "upgrades": ups})
+            break
+    return plans[:2]
+
+
 def transfer_targets(sell_price, pos, players, fixmap, horizon, next_gw,
                      exclude_ids, limit=8):
     """Best available replacements at or under the budget."""
@@ -1093,6 +1208,60 @@ def render(ctx):
                 f"{t['count']}/{size} | {t['eo']:.0f}% |")
         add("")
 
+    # ---- restructuring
+    if ctx["funding"]:
+        add("## Funding a move")
+        add("")
+        add("Cash in the bank scores nothing. These are restructures, not "
+            "savings plans: sell something underperforming its price, replace "
+            "it cheaply, and spend the difference on an actual upgrade.")
+        add("")
+        for plan in ctx["funding"]:
+            w, c = plan["weak"], plan["cheap"]
+            add(f"**{w['name']} (£{w['price']:.1f}m) is your worst value at "
+                f"{plan['ppm']} pts per million.**")
+            add("")
+            add(f"- Sell {w['name']} for about £{plan['sell']:.1f}m "
+                f"(estimated, see note below)")
+            add(f"- Replace with {c['name']} ({c['club']}, £{c['price']:.1f}m, "
+                f"{c['ppg']} ppg)")
+            add(f"- That leaves you £{plan['freed']:.1f}m to spend")
+            add("")
+            add("  Which buys:")
+            for u in plan["upgrades"]:
+                # A -4 hit is only worth taking if the gain pays it back fast.
+                weeks = (4.0 / u["gain"]) if u["gain"] > 0 else None
+                if weeks is None:
+                    verdict = ""
+                elif weeks <= 2:
+                    verdict = f", clears the -4 in {weeks:.1f} weeks: worth the hit"
+                elif weeks <= 5:
+                    verdict = (f", clears the -4 in {weeks:.1f} weeks: "
+                               f"split it over two gameweeks instead")
+                else:
+                    verdict = (f", needs {weeks:.1f} weeks to clear a -4: "
+                               f"free transfers only")
+                add(f"  - {u['out']['name']} ({u['out']['ppg']} ppg) to "
+                    f"{u['in']['name']} ({u['in']['ppg']} ppg, "
+                    f"£{u['in']['price']:.1f}m): {u['gain']:+.2f} ppg{verdict}")
+            add("")
+        add("**Two transfers, so this is a -4 hit if you do both this week.** "
+            "The upgrade has to beat four points to be worth it, or split it "
+            "across two gameweeks and pay nothing.")
+        add("")
+        add("Sell prices are estimated. FPL refunds your purchase price plus "
+            "half of any rise, and your real purchase prices are not public, "
+            "so this assumes you have held since the opener. Check the actual "
+            "figure in the app before committing.")
+        add("")
+    elif ctx["finished_gws"] < EARLY_SEASON_GWS:
+        add("## Funding a move")
+        add("")
+        add(f"Too early. Points per million means nothing after "
+            f"{ctx['finished_gws']} gameweek(s), and selling on one bad "
+            f"afternoon is how squads get wrecked in August.")
+        add("")
+
     # ---- what rivals did
     add("## Rival moves")
     add("")
@@ -1226,6 +1395,8 @@ def main():
     outlook, blanks, doubles = fixture_outlook(
         my_picks, players, fixmap, args.horizon, next_gw)
     threat_rows = threats(owners, eo, my_picks, players, size)
+    funding = funding_plans(my_picks, players, fixmap, next_gw, bank,
+                            finished_gws)
     captain_pick, captain_reason = recommend_captain(captains, stance)
 
     template = sorted(
@@ -1345,6 +1516,7 @@ def main():
         "blanks": blanks,
         "doubles": doubles,
         "threats": threat_rows,
+        "funding": funding,
         "chip_alerts": chip_alerts,
         "chips_used": chips_used,
         "rival_transfers": rival_transfers,
