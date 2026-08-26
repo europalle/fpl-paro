@@ -2,9 +2,16 @@ name: FPL daily brief
 
 on:
   schedule:
-    # 14:45 UTC daily. That is 16:45 Copenhagen in summer, 15:45 in winter.
-    # Deliberately ~20 minutes before the Claude scheduled task reads it.
-    - cron: "45 14 * * *"
+    # GitHub's scheduler is best effort. Runs get delayed under load and are
+    # sometimes dropped outright, so one cron entry is not a schedule, it is a
+    # hope. Three attempts, spaced an hour apart, all finishing well before the
+    # Claude task reads the repo at 15:05 UTC.
+    #
+    # Minutes are deliberately odd. Round numbers like :00, :15, :30 and :45 are
+    # the most contended slots on the platform and the most likely to slip.
+    - cron: "7 12 * * *"
+    - cron: "7 13 * * *"
+    - cron: "7 14 * * *"
   workflow_dispatch:
 
 permissions:
@@ -34,6 +41,7 @@ jobs:
 
       - name: Generate brief
         run: |
+          echo "Triggered by: ${GITHUB_EVENT_NAME} at $(date -u +%H:%M) UTC"
           mkdir -p briefs
           python3 fpl_brief.py \
             --entry 8876628 \
