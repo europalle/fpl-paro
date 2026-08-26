@@ -1,18 +1,22 @@
 name: FPL daily brief
 
 on:
-  schedule:
-    # GitHub's scheduler is best effort. Runs get delayed under load and are
-    # sometimes dropped outright, so one cron entry is not a schedule, it is a
-    # hope. Three attempts, spaced an hour apart, all finishing well before the
-    # Claude task reads the repo at 15:05 UTC.
-    #
-    # Minutes are deliberately odd. Round numbers like :00, :15, :30 and :45 are
-    # the most contended slots on the platform and the most likely to slip.
-    - cron: "7 12 * * *"
-    - cron: "7 13 * * *"
-    - cron: "7 14 * * *"
+  # PRIMARY TRIGGER: an external cron service POSTs to this workflow's
+  # dispatches endpoint once a day. API-dispatched runs start immediately
+  # instead of queueing behind GitHub's scheduled work, which is what kept
+  # arriving late or not at all.
   workflow_dispatch:
+
+  # BACKSTOP ONLY. GitHub's own scheduler is best effort and drifts badly under
+  # load, so these are not relied on, they are just free insurance in case the
+  # external trigger is the thing that breaks. The commit step is idempotent,
+  # so a duplicate run costs nothing: it either commits a fresher brief or
+  # exits saying there was nothing to change.
+  #
+  # Odd minutes on purpose. :00, :15, :30 and :45 are the most contended slots.
+  schedule:
+    - cron: "7 12 * * *"
+    - cron: "7 14 * * *"
 
 permissions:
   contents: write
